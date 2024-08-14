@@ -181,7 +181,7 @@ For TURN-TLS/TURN-DTLS listeners, `tls.mode` must be set to `Terminate` or omitt
 
 STUNner will automatically generate a Kubernetes LoadBalancer Service to expose each Gateway to clients. All TURN listeners specified in the Gateway are wrapped by a single Service and will be assigned a single externally reachable IP address. If you want multiple TURN listeners on different public IPs, create multiple Gateways. TURN over UDP and TURN over DTLS listeners are exposed as UDP services, TURN-TCP and TURN-TLS listeners are exposed as TCP.
 
-STUNner implements two ways to customize the automatically created Service, both involving certain pre-defined [annotations](https://kubernetes.io/docs/concepts/overview/working-with-objects/annotations).  First, you can add global annotations to the `loadBalancerServiceAnnotations` field of the [GatewayConfig spec](#gatewayconfig), which affect the Service created for each Gateway that links to the GatewayConfig (via the GatewayClass `parametersRef`). To customize annotations on a per-gateway status, you can also add specific annotations to the Gateway itself. Gateway annotations override the global annotations on conflict.
+STUNner implements several ways to customize the automatically created Service, each involving certain pre-defined [annotations](https://kubernetes.io/docs/concepts/overview/working-with-objects/annotations).  First, you can add global annotations to the `loadBalancerServiceAnnotations` field of the [GatewayConfig spec](#gatewayconfig), which affect the Service created for each Gateway that links to the GatewayConfig (via the GatewayClass `parametersRef`). To customize annotations on a per-gateway status, you can also add specific annotations to the Gateway itself. Gateway annotations override the global annotations on conflict. Finally, you can also add custom labels/annotations to the automatically created STUNner Services manually, these are retained on Service update (unless there is a conflict). Note that labels/annotations added via the Gateway and the GatewayConfig are also propagated to the corresponding `stunnerd` Deployments.
 
 The following rules apply:
 - Each annotation is copied verbatim into the Service created for any Gateway. This can be used, for instance, to specify health-check settings on the load-balancer Service (using the `service.beta.kubernetes.io/*-loadbalancer-healthcheck-*` annotations, see above).
@@ -191,8 +191,8 @@ STUNner defines the following special annotations:
 
 1. **Service type:** The special annotation `stunner.l7mp.io/service-type` can be used to customize the type of the Service created by STUNner. The value can be either `ClusterIP`, `NodePort`, or `LoadBalancer` (this is the default); for instance, setting `stunner.l7mp.io/service-type: ClusterIP` will prevent STUNner from exposing a Gateway publicly (useful for testing).
 
-1. **Mixed-protocol support:** Currently, STUNner limits each Gateway to a single transport protocol, e.g., UDP or TCP. This is intended to improve the consistency across the Kubernetes services of different cloud providers, which provide varying support for [mixed multi-protocol LoadBalancer Services](https://kubernetes.io/docs/concepts/services-networking/service/#load-balancers-with-mixed-protocol-types). If you still want to expose a UDP and a TCP port on the same IP using a single Gateway, add the annotation `stunner.l7mp.io/enable-mixed-protocol-lb: true` to the Gateway. Since mixed-protocol LB support is not supported in many popular Kubernetes offerings, STUNner currently defaults to disabling this feature. 
- 
+1. **Mixed-protocol support:** Currently, STUNner limits each Gateway to a single transport protocol, e.g., UDP or TCP. This is intended to improve the consistency across the Kubernetes services of different cloud providers, which provide varying support for [mixed multi-protocol LoadBalancer Services](https://kubernetes.io/docs/concepts/services-networking/service/#load-balancers-with-mixed-protocol-types). If you still want to expose a UDP and a TCP port on the same IP using a single Gateway, add the annotation `stunner.l7mp.io/enable-mixed-protocol-lb: true` to the Gateway. Since mixed-protocol LB support is not supported in many popular Kubernetes offerings, STUNner currently defaults to disabling this feature.
+
    The below Gateway will expose both ports with their respective protocols.
 
    ```yaml
@@ -219,6 +219,30 @@ STUNner defines the following special annotations:
 
 1. **Selecting the NodePort:** By default, Kubernetes assigns a random external port from the range [32000-32767] to each listener of a Gateway exposed with a NodePort Service. This requires all ports in the [32000-32767] range to be opened on the external firewall, which may raise security concerns for hardened deployments. In order to assign specific nodeports to particular listeners, add the annotation `stunner.l7mp.io/nodeport:` `{listener_name_1:nodeport_1,listener_name_2:nodeport_2,...}` to the Gateway, where each key-value pair is a name of a listener and the selected (numeric) NodePort. The value itself must be proper a JSON map. Unknown listeners are silently ignored. Note that STUNner makes no specific effort to reconcile conflicting NodePorts: whenever the selected NodePort is unavailable Kubernetes will silently reject the Service, which can lead to hard-to-debug failures. Use this feature at your own risk.
 
+1. **Selecting the target port:** Some hardened Kubernetes deployments prohibit containers to open privileged ports (i.e., everything under 1024). This causes problems when one wants to ingest TURN over the standard TCP/TLS port 443. Kubernetes lets Services to choose an arbitrary [target port](https://kubernetes.io/docs/concepts/services-networking/service/#defining-a-service) for each service port, which makes it possible to map a particular external port to an arbitrary (potentially non-privileged) port in the containers. In order to enforce a particular target port per listener, add the annotation `stunner.l7mp.io/targetport:` `{listener_name_1:targetport_1,...}` to the corresponding Gateway (the syntax and semantics are the same as those for the nodeport annotation). For instance, the below Gateway would expose the TURN TCP/TLS on port 443, but it would map the egress port to the target port 44321 in the STUNner dataplane container:
+
+   ```yaml
+   apiVersion: gateway.networking.k8s.io/v1
+   kind: Gateway
+   metadata:
+     name: tls-gateway
+     annotations:
+       stunner.l7mp.io/targetport: "{\"tls-listener\":44321}"
+   spec:
+     gatewayClassName: stunner-gatewayclass
+     listeners:
+     - name: tls-listener
+       port: 443
+       protocol: TURN-TLS
+       tls:
+         certificateRefs:
+           - kind: Secret
+             namespace: stunner
+             name: tls-secret
+   ```
+
+1. **Disabling the exposition of the health-check port:** Some older Kubernetes load-balancer providers required the exposition of the health-check port on LoadBalancer Services for UDP listeners to become externally reachable. Therefore, by default STUNner adds the health-check port (usually set via specific Gateway annotations) to the service-ports in automatically created LoadBalancer services. This has the unfortunate consequence that the health-check port becomes publicly reachable, which is considered a security issue by some, see https://github.com/l7mp/stunner-gateway-operator/issues/49. To prevent STUNner from exposing the health-check port, add the annotation `stunner.l7mp.io/disable-health-check-expose: true` to the corresponding Gateway. Note that this may cause TURN/UDP listeners unreachable on the Gateway, so use this only if you know that this setting will work with your Kubernetes provider.
+
 The below table summarizes the Gateway annotations supported by STUNner.
 
 | Key/value                                           | Description                                                                                                                                                | Default        |
@@ -228,6 +252,9 @@ The below table summarizes the Gateway annotations supported by STUNner.
 | `stunner.l7mp.io/external-traffic-policy: <string>` | Se the value to `Local` to preserve clients' source IP at the load balancer.                                                                               | `Cluster`      |
 | `stunner.l7mp.io/disable-managed-dataplane: <bool>` | Switch managed-dataplane support off for a Gateway.                                                                                                        | False          |
 | `stunner.l7mp.io/nodeport: <map>`                   | Request a specific NodePort for particular listeners. Value is a JSON map of listener-nodeport key-value pairs.                                            | None           |
+| `stunner.l7mp.io/targetport: <map>`                 | Request a specific target port for particular listeners. Value is a JSON map of listener-targetport key-value pairs.                                       | None           |
+| `stunner.l7mp.io/disable-health-check-expose: true` | Disable the default exposition of the health-check port (if any).                                                                                          | False          |
+
 
 ## UDPRoute
 
@@ -360,26 +387,28 @@ spec:
 
 The following fields can be set in the Dataplane `spec` to customize the provisioning of `stunnerd` pods.
 
-| Field                           | Type       | Description                                                                                                                                                                                                   | Required |
-|:--------------------------------|:----------:|:--------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------|:--------:|
-| `image`                         | `string`   | The container image.                                                                                                                                                                                          | Yes      |
-| `imagePullPolicy`               | `string`   | Policy for if/when to pull the [`stunnerd`](/cmd/stunnerd/README.md), either `Always`, `Never`, or `IfNotPresent`. Default: `Always` if the `latest` tag is specified on the image, `IfNotPresent` otherwise. | No       |
-| `command`                       | `list`     | Entrypoints for the [dataplane container](https://pkg.go.dev/k8s.io/api/core/v1#Container).                                                                                                                   | No       |
-| `args`                          | `list`     | Command line arguments for the [dataplane container](https://pkg.go.dev/k8s.io/api/core/v1#Container).                                                                                                        | No       |
-| `envFrom`                       | `list`     | List of sources to populate environment variables for the [dataplane container](https://pkg.go.dev/k8s.io/api/core/v1#Container). Default: empty.                                                             | No       |
-| `env`                           | `list`     | List of environment variables for the [dataplane container](https://pkg.go.dev/k8s.io/api/core/v1#Container). Default: empty.                                                                                 | No       |
-| `containerSecurityContext`      | `object`   | Container-level security attributes for the [dataplane](/cmd/stunnerd/README.md) pods. Default: none.                                                                                                         | No       |
-| `replicas`                      | `int`      | Number of dataplane pods per Gateway to provision. Not enforced if the [dataplane](/cmd/stunnerd/README.md) Deployment replica count is overwritten manually or by an autoscaler. Default: 1.                 | No       |
-| `imagePullSecrets`              | `list`     | List of Secret references to use for pulling the `stunnerd` image. Each ref is a secret name, namespace is the same as that of the Gateway on behalf of which the dataplane is deployed.                      | No       |
-| `hostNetwork`                   | `bool`     | Deploy the [dataplane](/cmd/stunnerd/README.md) into the host network namespace of Kubernetes nodes. Useful for implementing headless TURN services. May require elevated privileges. Default: false.         | No       |
-| `resources`                     | `object`   | Compute resources per [dataplane](/cmd/stunnerd/README.md) pod. Default: none.                                                                                                                                | No       |
-| `affinity`                      | `object`   | Scheduling constraints for the [dataplane](/cmd/stunnerd/README.md) pods. Default: none.                                                                                                                      | No       |
-| `tolerations`                   | `object`   | Tolerations for the [dataplane](/cmd/stunnerd/README.md) pods. Default: none.                                                                                                                                 | No       |
-| `securityContext`               | `object`   | Pod-level security attributes for the [dataplane](/cmd/stunnerd/README.md) pods. Default: none.                                                                                                               | No       |
-| `topologySpreadConstraints`     | `object`   | Description of how the [dataplane](/cmd/stunnerd/README.md) pods for a Gateway ought to spread across topology domains. Default: none.                                                                        | No       |
-| `disableHealthCheck`            | `bool`     | Disable health-checking. If true, enable HTTP health-checks on port 8086: liveness probe responder will be exposed on path `/live` and readiness probe on path `/ready`. Default: true.                       | No       |
-| `enableMetricsEndpoint`         | `bool`     | Enable Prometheus metrics scraping. If true, a metrics endpoint will be available at `http://0.0.0.0:8080`. Default: false.                                                                                   | No       |
-| `terminationGracePeriodSeconds` | `duration` | Optional duration in seconds for `stunnerd` to terminate gracefully. Default: 30 seconds.                                                                                                                     | No       |
+| Field                           | Type       | Description                                                                                                                                                                                                            | Required |
+|:--------------------------------|:----------:|:-----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------|:--------:|
+| `image`                         | `string`   | The container image.                                                                                                                                                                                                   | Yes      |
+| `imagePullPolicy`               | `string`   | Policy for if/when to pull the [`stunnerd`](/cmd/stunnerd/README.md), either `Always`, `Never`, or `IfNotPresent`. Default: `Always` if the `latest` tag is specified on the image, `IfNotPresent` otherwise.          | No       |
+| `imagePullSecrets`              | `list`     | List of Secret references to use for pulling the `stunnerd` image. Each ref is a secret name, namespace is the same as that of the Gateway on behalf of which the dataplane is deployed.                               | No       |
+| `labels`                        | `map`      | Custom labels added to `stunnerd` pods. Mandatory labels override whatever is set here. Changing pod labels triggers full dataplane restart for the affected Gateways.                                                 | No       |
+| `annotations`                   | `map`      | Custom annotations added to `stunnerd` pods. Mandatory annotations override whatever is set here, which in turn override manually added annotations. Changes trigger full dataplane restart for the affected Gateways. | No       |
+| `command`                       | `list`     | Entrypoints for the [dataplane container](https://pkg.go.dev/k8s.io/api/core/v1#Container).                                                                                                                            | No       |
+| `args`                          | `list`     | Command line arguments for the [dataplane container](https://pkg.go.dev/k8s.io/api/core/v1#Container).                                                                                                                 | No       |
+| `envFrom`                       | `list`     | List of sources to populate environment variables for the [dataplane container](https://pkg.go.dev/k8s.io/api/core/v1#Container). Default: empty.                                                                      | No       |
+| `env`                           | `list`     | List of environment variables for the [dataplane container](https://pkg.go.dev/k8s.io/api/core/v1#Container). Default: empty.                                                                                          | No       |
+| `containerSecurityContext`      | `object`   | Container-level security attributes for the [dataplane](/cmd/stunnerd/README.md) pods. Default: none.                                                                                                                  | No       |
+| `replicas`                      | `int`      | Number of dataplane pods per Gateway to provision. Not enforced if the [dataplane](/cmd/stunnerd/README.md) Deployment replica count is overwritten manually or by an autoscaler. Default: 1.                          | No       |
+| `hostNetwork`                   | `bool`     | Deploy the [dataplane](/cmd/stunnerd/README.md) into the host network namespace of Kubernetes nodes. Useful for implementing headless TURN services. May require elevated privileges. Default: false.                  | No       |
+| `resources`                     | `object`   | Compute resources per [dataplane](/cmd/stunnerd/README.md) pod. Default: none.                                                                                                                                         | No       |
+| `affinity`                      | `object`   | Scheduling constraints for the [dataplane](/cmd/stunnerd/README.md) pods. Default: none.                                                                                                                               | No       |
+| `tolerations`                   | `object`   | Tolerations for the [dataplane](/cmd/stunnerd/README.md) pods. Default: none.                                                                                                                                          | No       |
+| `securityContext`               | `object`   | Pod-level security attributes for the [dataplane](/cmd/stunnerd/README.md) pods. Default: none.                                                                                                                        | No       |
+| `topologySpreadConstraints`     | `object`   | Description of how the [dataplane](/cmd/stunnerd/README.md) pods for a Gateway ought to spread across topology domains. Default: none.                                                                                 | No       |
+| `disableHealthCheck`            | `bool`     | Disable health-checking. If true, enable HTTP health-checks on port 8086: liveness probe responder will be exposed on path `/live` and readiness probe on path `/ready`. Default: true.                                | No       |
+| `enableMetricsEndpoint`         | `bool`     | Enable Prometheus metrics scraping. If true, a metrics endpoint will be available at `http://0.0.0.0:8080`. Default: false.                                                                                            | No       |
+| `terminationGracePeriodSeconds` | `duration` | Optional duration in seconds for `stunnerd` to terminate gracefully. Default: 30 seconds.                                                                                                                              | No       |
 
 There can be multiple Dataplane resources defined in a cluster, say, one for the production workload and one for development. Use the `spec.dataplane` field in the GatewayConfig to choose the Dataplane per each STUNner install.
 
