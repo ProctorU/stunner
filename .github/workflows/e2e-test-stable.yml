@@ -1,20 +1,20 @@
-name: Run End-to-End Test
+name: Run End-to-End Test (stable)
 
 on:
   workflow_dispatch:
   schedule:
-  - cron: '0 11 * * 1'
+  - cron: '0 11 1-7,15-21 * 2'
 
 jobs:
   e2e_test:
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v3
+      - uses: actions/checkout@v4
 
       - name: Set up Go
-        uses: actions/setup-go@v4
+        uses: actions/setup-go@v5
         with:
-          go-version: '1.20'
+          go-version: '1.22'
 
       - name: Download modules
         run: go mod download
@@ -35,16 +35,15 @@ jobs:
         run: minikube tunnel &>mktunnel.log &
 
       - name: Set up Helm
-        uses: azure/setup-helm@v3
+        uses: azure/setup-helm@v4
         with:
-          version: v3.11.3
+          version: v3.14.2
 
       - name: Install STUNner
         run: |
           helm repo add stunner https://l7mp.io/stunner
           helm repo update
-          helm install stunner-gateway-operator stunner/stunner-gateway-operator-dev --create-namespace --namespace=stunner
-          helm install stunner stunner/stunner-dev --create-namespace --namespace=stunner
+          helm install stunner-gateway-operator stunner/stunner-gateway-operator --create-namespace --namespace=stunner  --set stunnerGatewayOperator.dataplane.mode=managed  --set stunnerGatewayOperator.deployment.container.manager.resources.requests.cpu=200m  --set stunnerGatewayOperator.dataplane.spec.resources.requests.cpu=100m
 
       - name: Deploy iperf server
         run: kubectl apply -f docs/examples/simple-tunnel/iperf-server.yaml
@@ -61,12 +60,13 @@ jobs:
 
       - name: Wait for LoadBalancer IP
         run: |
-          while [[ -z $(kubectl get svc udp-gateway -n stunner -o jsonpath="{.status.loadBalancer.ingress[0].ip}") ]]; do echo "Waiting for LoadBalancer IP"; sleep 2; done
+          for n in {1..60}; do [[ ! -z $(kubectl get svc udp-gateway -n stunner -o jsonpath="{.status.loadBalancer.ingress[0].ip}") ]] && break; echo "Waiting for LoadBalancer IP"; sleep 2; done
+          kubectl wait -n stunner --for=condition=Available deployment udp-gateway --timeout 5m
           kubectl get all -A
 
       - name: Start turncat
         run: |
-          ./turncat --log=all:INFO udp://127.0.0.1:5000 k8s://stunner/stunnerd-config:udp-listener udp://$(kubectl get svc iperf-server -o jsonpath="{.spec.clusterIP}"):5001 &>turncat.log &
+          ./turncat --log=all:INFO udp://127.0.0.1:5000 k8s://stunner/udp-gateway:udp-listener udp://$(kubectl get svc iperf-server -o jsonpath="{.spec.clusterIP}"):5001 &>turncat.log &
           sleep 1
 
       - name: Run iperf client
@@ -86,6 +86,8 @@ jobs:
           cat turncat.log
           echo "* STUNNER"
           kubectl logs -n stunner $(kubectl get pods -n stunner -l app=stunner -o jsonpath='{.items[0].metadata.name}')
+          echo "* STUNNER-GATEWAY=OPERATOR"
+          kubectl logs -n stunner $(kubectl get pods -n stunner -l control-plane=stunner-gateway-operator-controller-manager -o jsonpath='{.items[0].metadata.name}')
 
       - name: Check iperf conectivity
         run: grep "Server Report" iperf.log

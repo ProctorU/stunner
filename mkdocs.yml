@@ -9,7 +9,7 @@ theme:
   name: readthedocs
   highlightjs: true
 nav:
-- 'README.md'
+- 'STUNner documentation': 'README.md'
 - 'Why STUNner': 'WHY.md'
 - 'Deployment models': 'DEPLOYMENT.md'
 - 'Concepts': 'CONCEPTS.md'
@@ -27,6 +27,7 @@ nav:
   - 'Kurento Magic Mirror': 'examples/kurento-magic-mirror/README.md'
   - 'LiveKit': 'examples/livekit/README.md'
   - 'Jitsi': 'examples/jitsi/README.md'
+  - 'mediasoup': 'examples/mediasoup/README.md'
   - 'Cloud Retro': 'examples/cloudretro/README.md'
   - 'N.eko': 'examples/neko/README.md'
   - 'Benchmark': 'examples/benchmark/README.md'
