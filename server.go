@@ -6,13 +6,22 @@ import (
 	"net"
 
 	"github.com/pion/dtls/v2"
-	"github.com/pion/turn/v2"
+	"github.com/pion/turn/v3"
+	"golang.org/x/time/rate"
 
 	"github.com/l7mp/stunner/internal/object"
 	"github.com/l7mp/stunner/internal/telemetry"
 	"github.com/l7mp/stunner/internal/util"
-	"github.com/l7mp/stunner/pkg/apis/v1alpha1"
+	stnrv1 "github.com/l7mp/stunner/pkg/apis/v1"
 )
+
+// Number of log events per second reported at ERROR, WARN and INFO loglevel (logging at DEBUG and
+// TRACE levels is not rate-limited).
+var LogRateLimit rate.Limit = 1.0
+
+// Burst size for rate-limited logging at ERROR, WARN and INFO loglevel (logging at DEBUG and TRACE
+// levels is not rate-limited).
+var LogBurst = 3
 
 // Start will start the TURN server that belongs to  a listener.
 func (s *Stunner) StartServer(l *object.Listener) error {
@@ -22,22 +31,16 @@ func (s *Stunner) StartServer(l *object.Listener) error {
 	var pConns []turn.PacketConnConfig
 	var lConns []turn.ListenerConfig
 
-	relay := &telemetry.RelayAddressGenerator{
-		Name:         l.Name,
-		RelayAddress: l.Addr,
-		Address:      l.Addr.String(),
-		MinPort:      uint16(l.MinPort),
-		MaxPort:      uint16(l.MaxPort),
-		Net:          l.Net,
-	}
+	relay := NewRelayGen(l, s.logger)
+	relay.PortRangeChecker = s.GenPortRangeChecker(relay)
 
 	permissionHandler := s.NewPermissionHandler(l)
 
-	addr := fmt.Sprintf("%s:%d", l.Addr.String(), l.Port)
+	addr := fmt.Sprintf("0.0.0.0:%d", l.Port)
 
 	switch l.Proto {
-	case v1alpha1.ListenerProtocolUDP:
-		socketPool := util.NewPacketConnPool(l.Net, s.udpThreadNum)
+	case stnrv1.ListenerProtocolTURNUDP:
+		socketPool := util.NewPacketConnPool(l.Name, l.Net, s.udpThreadNum)
 
 		s.log.Infof("setting up UDP listener socket pool at %s with %d readloop threads",
 			addr, socketPool.Size())
@@ -47,9 +50,8 @@ func (s *Stunner) StartServer(l *object.Listener) error {
 		}
 
 		for _, c := range conns {
-			udpListener := telemetry.NewPacketConn(c, l.Name, telemetry.ListenerType)
 			conn := turn.PacketConnConfig{
-				PacketConn:            udpListener,
+				PacketConn:            c,
 				RelayAddressGenerator: relay,
 				PermissionHandler:     permissionHandler,
 			}
@@ -58,7 +60,7 @@ func (s *Stunner) StartServer(l *object.Listener) error {
 			pConns = append(pConns, conn)
 		}
 
-	case v1alpha1.ListenerProtocolTCP:
+	case stnrv1.ListenerProtocolTURNTCP:
 		s.log.Debugf("setting up TCP listener at %s", addr)
 
 		tcpListener, err := net.Listen("tcp", addr)
@@ -78,7 +80,7 @@ func (s *Stunner) StartServer(l *object.Listener) error {
 		l.Conns = append(l.Conns, conn)
 
 		// cannot test this on vnet, no TLS in vnet.Net
-	case v1alpha1.ListenerProtocolTLS:
+	case stnrv1.ListenerProtocolTURNTLS:
 		s.log.Debugf("setting up TLS/TCP listener at %s", addr)
 
 		cer, err := tls.X509KeyPair(l.Cert, l.Key)
@@ -113,7 +115,7 @@ func (s *Stunner) StartServer(l *object.Listener) error {
 		lConns = append(lConns, conn)
 		l.Conns = append(l.Conns, conn)
 
-	case v1alpha1.ListenerProtocolDTLS:
+	case stnrv1.ListenerProtocolTURNDTLS:
 		s.log.Debugf("setting up DTLS/UDP listener at %s", addr)
 
 		cer, err := tls.X509KeyPair(l.Cert, l.Key)
@@ -123,7 +125,10 @@ func (s *Stunner) StartServer(l *object.Listener) error {
 		}
 
 		// for some reason dtls.Listen requires a UDPAddr and not an addr string
-		udpAddr := &net.UDPAddr{IP: l.Addr, Port: l.Port}
+		udpAddr, err := net.ResolveUDPAddr("udp", addr)
+		if err != nil {
+			return fmt.Errorf("failed to parse DTLS listener address %s: %s", addr, err)
+		}
 		dtlsListener, err := dtls.Listen("udp", udpAddr, &dtls.Config{
 			Certificates: []tls.Certificate{cer},
 			// ExtendedMasterSecret: dtls.RequireExtendedMasterSecret,
@@ -156,9 +161,9 @@ func (s *Stunner) StartServer(l *object.Listener) error {
 	t, err := turn.NewServer(turn.ServerConfig{
 		Realm:             s.GetRealm(),
 		AuthHandler:       s.NewAuthHandler(),
-		LoggerFactory:     s.logger,
 		PacketConnConfigs: pConns,
 		ListenerConfigs:   lConns,
+		LoggerFactory:     s.logger.WithRateLimiter(LogRateLimit, LogBurst),
 	})
 	if err != nil {
 		return fmt.Errorf("cannot set up TURN server for listener %s: %w",

@@ -6,7 +6,8 @@ import (
 	"os"
 	"time"
 
-	"github.com/pion/transport/v2"
+	"github.com/l7mp/stunner/internal/telemetry"
+	"github.com/pion/transport/v3"
 )
 
 type FileConnAddr struct {
@@ -71,6 +72,7 @@ type PacketConnPool interface {
 // defaultPacketConPool implements a socketpool that consists of only a single socket, used as a fallback for architectures that do not support SO_REUSEPORT or when socket pooling is disabled.
 type defaultPacketConnPool struct {
 	transport.Net
+	listenerName string
 }
 
 // Make creates a PacketConnPool, caller must make sure to close the sockets.
@@ -82,8 +84,9 @@ func (p *defaultPacketConnPool) Make(network, address string) ([]net.PacketConn,
 		return []net.PacketConn{}, fmt.Errorf("failed to create PacketConn at %s "+
 			"(REUSEPORT: false): %s", address, err)
 	}
-	conns = append(conns, conn)
 
+	conn = telemetry.NewPacketConn(conn, p.listenerName, telemetry.ListenerType)
+	conns = append(conns, conn)
 	return conns, nil
 }
 
